@@ -238,6 +238,49 @@ async def start_followup_call(org_id: str, patient_id: str, to_number: str, agen
             resp.raise_for_status()
             return data
 
+
+@activity.defn
+async def get_org_scheduler_settings(org_id: int) -> Dict[str, Any]:
+    """Fetch per-org scheduler settings from backend.
+
+    Expected shape (example):
+      {"start_hour_est": 9, "end_hour_est": 17, "interval_minutes": 5, "enabled": true}
+
+    Falls back to an empty dict if not present or on parse errors.
+    """
+    import aiohttp
+
+    # Try a dedicated endpoint first, then fall back to org object
+    urls = [f"{API_BASE}/api/orgs/{org_id}/scheduler_settings", f"{API_BASE}/api/orgs/{org_id}"]
+    headers = _auth_headers()
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                async with session.get(url, headers=headers, timeout=10) as resp:
+                    txt = await resp.text()
+                    if resp.status == 404:
+                        continue
+                    resp.raise_for_status()
+                    try:
+                        data = json.loads(txt)
+                    except Exception:
+                        logger.debug("get_org_scheduler_settings: non-json response from %s", url)
+                        continue
+                    # Prefer a nested scheduler_settings key if present
+                    if isinstance(data, dict) and "scheduler_settings" in data and isinstance(data["scheduler_settings"], dict):
+                        return data["scheduler_settings"]
+                    if isinstance(data, dict):
+                        # If endpoint returns the settings directly, return them
+                        keys = {"start_hour_est", "end_hour_est", "interval_minutes", "enabled"}
+                        if keys.intersection(set(data.keys())):
+                            return data
+                        # otherwise, continue to next url
+                        continue
+            except Exception as e:
+                logger.debug("get_org_scheduler_settings: request %s failed: %s", url, e)
+                continue
+    return {}
+
 # -------------------------
 # Configuration
 # -------------------------
@@ -264,8 +307,39 @@ class CallbackWindowChecker:
         logger.info("[%s] CallbackWindowChecker start org=%s interval=%s window=%s-%s test=%s",
                     wf_id, org_id, interval_minutes, start_hour_est, end_hour_est, test_mode)
 
-        # 1) EST now via activity
-        est_iso = await workflow.execute_activity(get_est_now_iso, start_to_close_timeout=timedelta(seconds=10))
+            # 1) Fetch runtime org scheduler settings (backend-driven override)
+            try:
+                org_settings = await workflow.execute_activity(
+                    get_org_scheduler_settings,
+                    args=[org_id],
+                    start_to_close_timeout=timedelta(seconds=10),
+                    retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=1),
+                )
+                if org_settings:
+                    logger.info("[%s] Using org scheduler settings: %s", wf_id, _safe_json_dump(org_settings, 500))
+                else:
+                    org_settings = {}
+            except Exception as e:
+                logger.warning("[%s] Could not fetch org scheduler settings: %s", wf_id, e)
+                org_settings = {}
+
+            # Apply overrides from org_settings if present
+            try:
+                runtime_interval = int(org_settings.get("interval_minutes", interval_minutes))
+            except Exception:
+                runtime_interval = interval_minutes
+            try:
+                runtime_start = int(org_settings.get("start_hour_est", start_hour_est))
+            except Exception:
+                runtime_start = start_hour_est
+            try:
+                runtime_end = int(org_settings.get("end_hour_est", end_hour_est))
+            except Exception:
+                runtime_end = end_hour_est
+            enabled_flag = bool(org_settings.get("enabled", True))
+
+            # 2) EST now via activity
+            est_iso = await workflow.execute_activity(get_est_now_iso, start_to_close_timeout=timedelta(seconds=10))
         try:
             est_now = datetime.fromisoformat(est_iso)
         except Exception:
@@ -278,9 +352,22 @@ class CallbackWindowChecker:
         current_hour = est_now.hour if hasattr(est_now, "hour") else workflow.now().hour
         logger.info("[%s] EST now=%s hour=%d date=%s", wf_id, est_iso, current_hour, est_date)
 
-        # 2) window check
-        if not (start_hour_est <= current_hour < end_hour_est):
-            logger.info("[%s] Outside window %s-%s EST (hour=%d) - skipping", wf_id, start_hour_est, end_hour_est, current_hour)
+        # 2) window check (use runtime overrides)
+        if not enabled_flag:
+            logger.info("[%s] Checker disabled for org=%s via org settings - skipping", wf_id, org_id)
+            return {"skipped": True, "reason": "disabled"}
+
+        # Handle wrap-around windows (e.g., start=22 end=6 spans midnight)
+        def _in_window(hour: int, start: int, end: int) -> bool:
+            if start < 0 or start > 23 or end < 0 or end > 23:
+                return False
+            if start <= end:
+                return start <= hour < end
+            # wrap-around
+            return hour >= start or hour < end
+
+        if not _in_window(current_hour, runtime_start, runtime_end):
+            logger.info("[%s] Outside window %s-%s EST (hour=%d) - skipping", wf_id, runtime_start, runtime_end, current_hour)
             return {"skipped": True, "current_hour": current_hour}
 
         # 3) list calls for org/date
@@ -555,6 +642,7 @@ async def run_worker():
             get_est_now_iso,
             list_calls_for_org_on_date,
             fetch_call_readings,
+            get_org_scheduler_settings,
             get_patient,
             start_followup_call,
         ],
