@@ -1,0 +1,700 @@
+# annie_scheduler.py
+"""
+Annie scheduler using Temporal (Python).
+
+Key pieces
+- PatientDailyCall (WORKFLOW): starts calls, polls or waits for signal, checks readings,
+  retries on missed-pickup or no-readings. Detailed logs: RetryReason=..., ExitDecision=...
+- OrgDailyScheduler (WORKFLOW): (unchanged) starts PatientDailyCall for all patients (child workflows).
+- per-patient cron REGISTRATION (CLI): Registers a cron workflow per patient that directly runs PatientDailyCall.
+  CLI: python annie_scheduler.py per_patient_cron --org 6 --hour 13 --minute 22 [--start-now] [--replace]
+
+Config via environment variables at top of file.
+"""
+
+import asyncio
+import logging
+import sys
+import time
+import json
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import aiohttp
+
+from temporalio import activity, workflow
+from temporalio.client import Client
+from temporalio.worker import Worker
+from temporalio.common import RetryPolicy
+
+# ====== CONFIG (env) ======
+BASE_URL = os.getenv("ANNIE_BASE_URL", "https://app.carify.health")
+TASK_QUEUE = os.getenv("ANNIE_TASK_QUEUE", "annie-task-queue")
+TEMPORAL_ENDPOINT = os.getenv("TEMPORAL_ENDPOINT", "localhost:7233")
+
+SCHEDULE_DEFAULT_ORG_ID = int(os.getenv("SCHEDULE_DEFAULT_ORG_ID", "6"))
+SCHEDULE_DEFAULT_HOUR_EST = int(os.getenv("SCHEDULE_DEFAULT_HOUR_EST", "9"))
+SCHEDULE_DEFAULT_MINUTE_EST = int(os.getenv("SCHEDULE_DEFAULT_MINUTE_EST", "30"))
+
+CALL_POLL_INTERVAL = int(os.getenv("CALL_POLL_INTERVAL", "10"))      # seconds
+CALL_POLL_ATTEMPTS = int(os.getenv("CALL_POLL_ATTEMPTS", "12"))
+
+MAX_DAILY_RETRIES = int(os.getenv("MAX_DAILY_RETRIES", "3"))
+MISSED_PICKUP_DELAY_SECONDS = int(os.getenv("MISSED_PICKUP_DELAY_SECONDS", str(2 * 60)))
+RECHECK_READINGS_DELAY_SECONDS = int(os.getenv("RECHECK_READINGS_DELAY_SECONDS", str(5 * 60)))
+
+EXTRA_DEBUG = os.getenv("EXTRA_DEBUG", "false").lower() in ("1", "true", "yes")
+FORCE_RETRY = os.getenv("FORCE_RETRY", "false").lower() in ("1", "true", "yes")
+ANNIE_API_AUTH_HEADER = os.getenv("ANNIE_API_AUTH_HEADER")  # optional Authorization header
+
+# ====== Logging ======
+logging.basicConfig(
+    level=logging.DEBUG if EXTRA_DEBUG else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("annie_scheduler")
+
+# ====== Helpers (client-side only) ======
+def utc_date_for_est_today() -> str:
+    est = ZoneInfo("US/Eastern")
+    now_est = datetime.now(est)
+    now_utc = now_est.astimezone(ZoneInfo("UTC"))
+    return now_utc.date().isoformat()
+
+def est_time_to_utc_cron(hour: int, minute: int, tz_name: str = "US/Eastern") -> str:
+    today = datetime.now(ZoneInfo(tz_name))
+    local = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    utc_dt = local.astimezone(ZoneInfo("UTC"))
+    return f"{utc_dt.minute} {utc_dt.hour} * * *"
+
+# ====== Activities (external I/O) ======
+@activity.defn
+async def start_call(*args, **kwargs) -> str:
+    patient_id = kwargs.get("patient_id") if "patient_id" in kwargs else (args[0] if len(args) >= 1 else None)
+    workflow_id = kwargs.get("workflow_id") if "workflow_id" in kwargs else (args[1] if len(args) >= 2 else None)
+    org_id = kwargs.get("org_id") if "org_id" in kwargs else (args[2] if len(args) >= 3 else None)
+    to_number = kwargs.get("to_number") if "to_number" in kwargs else (args[3] if len(args) >= 4 else None)
+    agent = kwargs.get("agent", args[4] if len(args) >= 5 else "annie_RPM")
+    test_mode = kwargs.get("test_mode", args[5] if len(args) >= 6 else False)
+
+    if patient_id is None or workflow_id is None:
+        raise RuntimeError("start_call requires patient_id and workflow_id")
+
+    if test_mode:
+        fake = f"fake-call-{int(time.time())}"
+        logger.info("Activity[start_call] test_mode -> %s", fake)
+        return fake
+
+    if org_id is not None:
+        try:
+            org_id = int(org_id)
+        except Exception:
+            pass
+
+    # resolve phone if needed
+    if not to_number:
+        async with aiohttp.ClientSession() as s:
+            resp = await s.get(f"{BASE_URL}/api/patients/{patient_id}", timeout=30)
+            txt = await resp.text()
+            if resp.status == 404:
+                raise RuntimeError(f"patient not found: {patient_id}")
+            if resp.status >= 400:
+                raise RuntimeError(f"failed to fetch patient {patient_id}: {txt}")
+            try:
+                patient = await resp.json()
+            except Exception:
+                raise RuntimeError(f"patient endpoint returned non-json: {txt}")
+
+            to_number = (
+                patient.get("to_number")
+                or patient.get("phone")
+                or patient.get("mobile")
+                or patient.get("contact")
+                or patient.get("phone_number")
+            )
+            if not to_number:
+                raise RuntimeError(f"patient {patient_id} missing phone")
+
+    payload = {"org_id": org_id, "patient_id": int(patient_id), "to_number": to_number, "agent": agent}
+    if payload["org_id"] is None:
+        payload.pop("org_id")
+
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+
+    url = f"{BASE_URL}/api/calls/outbound"
+    logger.info("Activity[start_call] POST %s payload=%s", url, payload)
+    async with aiohttp.ClientSession() as s:
+        resp = await s.post(url, json=payload, timeout=60, headers=headers)
+        text = await resp.text()
+        if resp.status >= 400:
+            try:
+                err = await resp.json()
+            except Exception:
+                err = text
+            logger.error("Activity[start_call] backend error status=%s body=%s", resp.status, err)
+            raise RuntimeError(f"start_call failed: status={resp.status} body={err}")
+
+        try:
+            js = await resp.json()
+        except Exception:
+            logger.error("Activity[start_call] non-json response: %s", text)
+            raise RuntimeError(f"start_call got non-json response: {text}")
+
+        call_id = js.get("call_id") or js.get("CallSid") or js.get("id")
+        if call_id is None:
+            logger.error("Activity[start_call] missing call_id in response: %s", js)
+            raise RuntimeError(f"start_call response missing call_id: {js}")
+
+        call_id = str(call_id)
+        logger.info("Activity[start_call] success call_id=%s", call_id)
+        return call_id
+
+@activity.defn
+async def get_call_details(call_id: str) -> dict:
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    logger.info("Activity[get_call_details] %s", call_id)
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"{BASE_URL}/api/calls/{call_id}", timeout=30, headers=headers)
+        if resp.status == 404:
+            return {}
+        resp.raise_for_status()
+        return await resp.json()
+
+@activity.defn
+async def fetch_call_readings(call_id: str):
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    logger.info("Activity[fetch_call_readings] %s", call_id)
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"{BASE_URL}/api/calls/{call_id}/readings", timeout=30, headers=headers)
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        txt = await resp.text()
+        try:
+            return json.loads(txt)
+        except Exception:
+            return txt
+
+@activity.defn
+async def mark_call_completed(call_id: str, summary: dict):
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    logger.info("Activity[mark_call_completed] %s %s", call_id, summary)
+    async with aiohttp.ClientSession() as s:
+        await s.post(f"{BASE_URL}/api/calls/{call_id}/complete", json=summary, timeout=30, headers=headers)
+
+@activity.defn
+async def list_patients_for_org(org_id: int) -> list:
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    logger.info("Activity[list_patients_for_org] org=%s", org_id)
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"{BASE_URL}/api/patients", params={"org_id": org_id, "page": 1, "limit": 1000}, timeout=60, headers=headers)
+        resp.raise_for_status()
+        return await resp.json()
+
+@activity.defn
+async def list_calls_for_org_on_date(org_id: int, yyyy_mm_dd: str) -> list:
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    logger.info("Activity[list_calls_for_org_on_date] org=%s date=%s", org_id, yyyy_mm_dd)
+    url = f"{BASE_URL}/api/calls/"
+    params = {"org_id": org_id, "date": yyyy_mm_dd}
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(url, params=params, timeout=30, allow_redirects=True, headers=headers)
+        text = await resp.text()
+        if resp.status >= 400:
+            logger.error("Activity[list_calls_for_org_on_date] GET %s returned %s body=%s", resp.url, resp.status, text)
+            resp.raise_for_status()
+        try:
+            js = await resp.json()
+        except Exception:
+            logger.error("Activity[list_calls_for_org_on_date] response not JSON: %s", text)
+            return []
+        logger.info("Activity[list_calls_for_org_on_date] returned %d records", len(js) if isinstance(js, list) else 0)
+        return js
+
+@activity.defn
+async def get_est_today_date() -> str:
+    return utc_date_for_est_today()
+
+# ====== Reading normalization ======
+def _is_measurement_like(obj: dict) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    keys = set(k.lower() for k in obj.keys())
+    measurement_keys = {"type", "value", "reading_type", "systolic", "diastolic", "hr", "heartrate", "spo2", "bp", "timestamp"}
+    return len(keys.intersection(measurement_keys)) > 0
+
+def normalize_readings_payload(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [r for r in raw if r is not None]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s == "":
+            return []
+        try:
+            parsed = json.loads(s)
+            return normalize_readings_payload(parsed)
+        except Exception:
+            return []
+    if isinstance(raw, dict):
+        if "readings" in raw:
+            return normalize_readings_payload(raw["readings"])
+        if "value" in raw:
+            inner = raw["value"]
+            if isinstance(inner, dict) and "value" in inner:
+                return normalize_readings_payload(inner["value"])
+            return normalize_readings_payload(inner)
+        if "raw_text" in raw and isinstance(raw["raw_text"], str):
+            try:
+                parsed = json.loads(raw["raw_text"])
+                return normalize_readings_payload(parsed)
+            except Exception:
+                pass
+        if _is_measurement_like(raw):
+            return [raw]
+        return []
+    return []
+
+# ====== Workflows ======
+@workflow.defn
+class OrgDailyScheduler:
+    @workflow.run
+    async def run(self, org_id: int, test_mode: bool = False):
+        logger.info("OrgDailyScheduler started for org=%s test_mode=%s", org_id, test_mode)
+        patients = await workflow.execute_activity(
+            list_patients_for_org,
+            args=[org_id],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=3),
+        )
+        patients = patients or []
+        logger.info("OrgDailyScheduler: found %d patients for org=%s", len(patients), org_id)
+        for p in patients:
+            pid = p.get("id")
+            if not pid:
+                logger.warning("OrgDailyScheduler: skipping patient missing numeric id: %s", p)
+                continue
+            try:
+                await workflow.start_child_workflow(
+                    PatientDailyCall.run,
+                    args=[pid, org_id, None, "annie_RPM", test_mode],
+                    task_queue=TASK_QUEUE,
+                )
+                logger.info("OrgDailyScheduler started PatientDailyCall for patient.id=%s", pid)
+            except Exception as e:
+                logger.exception("OrgDailyScheduler failed to start child for patient=%s: %s", pid, e)
+
+@workflow.defn
+class PatientDailyCall:
+    def __init__(self):
+        self._latest_call_signal = None
+        self._call_signal_set = False
+
+    @workflow.signal
+    def call_status_signal(self, call_id: str, status: str):
+        self._latest_call_signal = {"call_id": call_id, "status": status}
+        self._call_signal_set = True
+
+    @workflow.run
+    async def run(self, patient_id: int, org_id: int = None, to_number: str = None, agent: str = "annie_RPM", test_mode: bool = False):
+        logger.info("Workflow started for patient=%s org=%s", patient_id, org_id)
+        retries = 0
+        last_call_id = None
+
+        while retries < MAX_DAILY_RETRIES:
+            retries += 1
+            wf_id = workflow.info().workflow_id
+            logger.info("Workflow attempt=%d/%d wf_id=%s patient=%s org=%s", retries, MAX_DAILY_RETRIES, wf_id, patient_id, org_id)
+
+            try:
+                raw_call_id = await workflow.execute_activity(
+                    start_call,
+                    args=[patient_id, wf_id, org_id, to_number, agent, test_mode],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=1),
+                )
+                last_call_id = str(raw_call_id) if raw_call_id is not None else None
+                logger.info("Started call (attempt=%d) call_id=%s patient=%s", retries, last_call_id, patient_id)
+            except Exception as e:
+                logger.exception("Activity[start_call] failed attempt=%d patient=%s: %s", retries, patient_id, e)
+                if retries >= MAX_DAILY_RETRIES:
+                    logger.info("ExitDecision=start_call_failed_max_retries patient=%s org=%s attempts=%d", patient_id, org_id, retries)
+                    try:
+                        await workflow.execute_activity(mark_call_completed, args=[last_call_id or "unknown", {"result": "start_call_failed_max_retries", "error": str(e)}], start_to_close_timeout=timedelta(seconds=20))
+                    except Exception:
+                        logger.exception("mark_call_completed failed for start_call failure")
+                    return {"result": "start_call_failed_max_retries", "patient": patient_id}
+                next_retry_ts = (workflow.now() + timedelta(seconds=MISSED_PICKUP_DELAY_SECONDS)).isoformat()
+                logger.info("RetryReason=activity_start_failed patient=%s attempt=%d next_retry_utc=%s delay_sec=%d", patient_id, retries, next_retry_ts, MISSED_PICKUP_DELAY_SECONDS)
+                await workflow.sleep(timedelta(seconds=MISSED_PICKUP_DELAY_SECONDS))
+                continue
+
+            # reset signal
+            self._call_signal_set = False
+            self._latest_call_signal = None
+
+            # wait for signal fast, else poll
+            status = None
+            try:
+                await workflow.wait_condition(lambda: getattr(self, "_call_signal_set", False), timeout=timedelta(seconds=CALL_POLL_INTERVAL * CALL_POLL_ATTEMPTS))
+                sig = self._latest_call_signal
+                if sig and sig.get("call_id") == last_call_id:
+                    status = sig.get("status")
+                    logger.info("Signal received for call_id=%s status=%s", last_call_id, status)
+            except Exception:
+                pass
+
+            if status is None:
+                for i in range(CALL_POLL_ATTEMPTS):
+                    try:
+                        details = await workflow.execute_activity(
+                            get_call_details,
+                            args=[last_call_id],
+                            start_to_close_timeout=timedelta(seconds=15),
+                            retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=2),
+                        )
+                    except Exception as e:
+                        logger.exception("Activity[get_call_details] failed for call=%s: %s", last_call_id, e)
+                        details = {}
+                    details = details or {}
+                    status = details.get("status")
+                    if status is not None:
+                        status = str(status).lower()
+                    logger.info("Polled call details call_id=%s poll=%d status=%s details_preview=%s", last_call_id, i + 1, status, str(details)[:400])
+                    if status in ("completed", "failed", "no-answer", "in_progress", "initiated"):
+                        break
+                    await workflow.sleep(timedelta(seconds=CALL_POLL_INTERVAL))
+
+            logger.info("Evaluated call_id=%s final_status=%s patient=%s", last_call_id, status, patient_id)
+
+            if str(status).lower() == "completed":
+                try:
+                    raw_readings = await workflow.execute_activity(
+                        fetch_call_readings,
+                        args=[last_call_id],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=2),
+                    )
+                except Exception as e:
+                    logger.exception("Activity[fetch_call_readings] failed for call=%s: %s", last_call_id, e)
+                    raw_readings = None
+
+                normalized = normalize_readings_payload(raw_readings)
+                valid_readings = [r for r in normalized if _is_measurement_like(r)]
+                logger.info("Normalized readings_count=%d valid_count=%d raw_preview=%s", len(normalized), len(valid_readings), str(raw_readings)[:500])
+
+                if FORCE_RETRY:
+                    logger.info("FORCE_RETRY=1 active -> treating valid_readings as empty for debugging")
+                    valid_readings = []
+
+                if valid_readings:
+                    logger.info("ExitDecision=result_ok patient=%s org=%s call_id=%s readings_count=%d", patient_id, org_id, last_call_id, len(valid_readings))
+                    try:
+                        await workflow.execute_activity(
+                            mark_call_completed,
+                            args=[last_call_id, {"result": "ok", "readings_count": len(valid_readings)}],
+                            start_to_close_timeout=timedelta(seconds=20),
+                        )
+                    except Exception as e:
+                        logger.exception("Activity[mark_call_completed] failed for call=%s: %s", last_call_id, e)
+                    return {"result": "ok", "call_id": last_call_id, "readings": valid_readings}
+                else:
+                    next_retry_ts = (workflow.now() + timedelta(seconds=RECHECK_READINGS_DELAY_SECONDS)).isoformat()
+                    logger.info("RetryReason=no_readings patient=%s org=%s attempt=%d/%d call_id=%s next_retry_utc=%s delay_sec=%d",
+                                patient_id, org_id, retries, MAX_DAILY_RETRIES, last_call_id, next_retry_ts, RECHECK_READINGS_DELAY_SECONDS)
+                    if retries >= MAX_DAILY_RETRIES:
+                        logger.info("ExitDecision=no_readings_max_retries patient=%s org=%s call_id=%s attempts=%d", patient_id, org_id, last_call_id, retries)
+                        try:
+                            await workflow.execute_activity(mark_call_completed, args=[last_call_id, {"result": "no_readings_max_retries", "readings_count": 0}], start_to_close_timeout=timedelta(seconds=20))
+                        except Exception:
+                            logger.exception("mark_call_completed failed when exhausting no_readings")
+                        return {"result": "no_readings_max_retries", "call_id": last_call_id}
+                    await workflow.sleep(timedelta(seconds=RECHECK_READINGS_DELAY_SECONDS))
+                    continue
+            else:
+                logger.info("Decision=not_completed (will retry) patient=%s org=%s call_id=%s status=%s attempt=%d", patient_id, org_id, last_call_id, status, retries)
+                next_retry_ts = (workflow.now() + timedelta(seconds=MISSED_PICKUP_DELAY_SECONDS)).isoformat()
+                logger.info("RetryReason=missed_pickup patient=%s org=%s attempt=%d/%d call_id=%s status=%s next_retry_utc=%s delay_sec=%d",
+                            patient_id, org_id, retries, MAX_DAILY_RETRIES, last_call_id, status, next_retry_ts, MISSED_PICKUP_DELAY_SECONDS)
+
+                if retries >= MAX_DAILY_RETRIES:
+                    logger.info("ExitDecision=not_completed_max_retries patient=%s org=%s call_id=%s attempts=%d status=%s", patient_id, org_id, last_call_id, retries, status)
+                    try:
+                        await workflow.execute_activity(mark_call_completed, args=[last_call_id, {"result": "not_completed_max_retries", "status": status}], start_to_close_timeout=timedelta(seconds=20))
+                    except Exception:
+                        logger.exception("mark_call_completed failed when exhausting not_completed")
+                    return {"result": "not_completed_max_retries", "call_id": last_call_id, "status": status}
+
+                # optional safety listing
+                try:
+                    today_est = await workflow.execute_activity(get_est_today_date, args=[], start_to_close_timeout=timedelta(seconds=15))
+                except Exception:
+                    today_est = utc_date_for_est_today()
+                try:
+                    _ = await workflow.execute_activity(list_calls_for_org_on_date, args=[org_id, today_est], start_to_close_timeout=timedelta(seconds=20))
+                except Exception as e:
+                    logger.exception("Activity[list_calls_for_org_on_date] failed: %s", e)
+
+                await workflow.sleep(timedelta(seconds=MISSED_PICKUP_DELAY_SECONDS))
+                continue
+
+        logger.info("ExitDecision=max_retries_exhausted patient=%s org=%s last_call=%s attempts=%d", patient_id, org_id, last_call_id, retries)
+        try:
+            await workflow.execute_activity(mark_call_completed, args=[last_call_id, {"result": "max_retries_exhausted"}], start_to_close_timeout=timedelta(seconds=20))
+        except Exception:
+            logger.exception("mark_call_completed failed while marking exhausted")
+        return {"result": "max_retries_exhausted", "call_id": last_call_id}
+
+# ====== Temporal client & worker ======
+async def connect_client(retries: int = 6, delay: int = 5) -> Client:
+    for i in range(retries):
+        try:
+            client = await Client.connect(TEMPORAL_ENDPOINT)
+            logger.info("Connected to Temporal at %s", TEMPORAL_ENDPOINT)
+            return client
+        except Exception as e:
+            logger.warning("Temporal connect failed (%d/%d): %s", i + 1, retries, e)
+            await asyncio.sleep(delay)
+    logger.error("Could not connect to Temporal at %s after %d attempts", TEMPORAL_ENDPOINT, retries)
+    raise RuntimeError("Temporal connect failed")
+
+async def run_worker():
+    client = await connect_client()
+    logger.info("Starting worker for task_queue=%s", TASK_QUEUE)
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[PatientDailyCall, OrgDailyScheduler],
+        activities=[
+            start_call,
+            get_call_details,
+            fetch_call_readings,
+            mark_call_completed,
+            list_patients_for_org,
+            list_calls_for_org_on_date,
+            get_est_today_date,
+        ],
+    )
+    logger.info("Worker created - now running (this call blocks until worker stops).")
+    await worker.run()
+    logger.info("Worker.run() returned (worker stopped).")
+
+# ====== Per-patient cron registration ======
+async def _fetch_patients_http(org_id: int) -> list:
+    """HTTP helper (outside of workflow) to fetch patients for registration time."""
+    headers = {}
+    if ANNIE_API_AUTH_HEADER:
+        headers["Authorization"] = ANNIE_API_AUTH_HEADER
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"{BASE_URL}/api/patients", params={"org_id": org_id, "page": 1, "limit": 1000}, timeout=60, headers=headers)
+        resp.raise_for_status()
+        return await resp.json()
+
+async def create_per_patient_crons(
+    org_id: int,
+    hour_est: int,
+    minute_est: int,
+    test_mode: bool = False,
+    start_now: bool = True,
+    replace_existing: bool = False,
+):
+    """
+    Register a cron workflow per patient that runs PatientDailyCall directly.
+    - start_now: also kicks one immediate PatientDailyCall for each patient.
+    - replace_existing: if a cron with the same id exists, terminate it first.
+    """
+    client = await connect_client()
+    cron = est_time_to_utc_cron(hour_est, minute_est, tz_name="US/Eastern")
+    logger.info("Per-patient cron registration for org=%s cron(UTC)=%s", org_id, cron)
+
+    # fetch patients via HTTP (we're not inside a workflow here)
+    try:
+        patients = await _fetch_patients_http(org_id)
+    except Exception as e:
+        logger.exception("Failed to fetch patients for org=%s: %s", org_id, e)
+        raise
+
+    if not patients:
+        logger.warning("No patients found for org=%s; nothing to schedule.", org_id)
+        return
+
+    for p in patients:
+        pid = p.get("id")
+        if not pid:
+            logger.warning("Skipping patient without numeric id: %s", p)
+            continue
+
+        wf_id = f"patient-scheduler-{org_id}-{pid}"  # stable per org+patient
+
+        # Optionally terminate existing workflow with same id
+        if replace_existing:
+            try:
+                existing = client.get_workflow_handle(wf_id)
+                await existing.terminate("replaced_by_new_registration")
+                logger.info("Terminated existing per-patient cron id=%s", wf_id)
+            except Exception:
+                # ignore if not found
+                pass
+
+        # Register cron PatientDailyCall
+        try:
+            handle = await client.start_workflow(
+                PatientDailyCall.run,
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+                args=[pid, org_id, None, "annie_RPM", test_mode],
+                cron_schedule=cron,
+            )
+            logger.info("Registered per-patient cron id=%s patient=%s cron=%s", handle.id, pid, cron)
+        except Exception as e:
+            logger.exception("Failed to register cron for patient=%s id=%s: %s", pid, wf_id, e)
+            continue
+
+        # Optional immediate run
+        if start_now:
+            try:
+                once_id = f"patient-scheduler-once-{org_id}-{pid}-{int(time.time())}"
+                once_h = await client.start_workflow(
+                    PatientDailyCall.run,
+                    id=once_id,
+                    task_queue=TASK_QUEUE,
+                    args=[pid, org_id, None, "annie_RPM", test_mode],
+                )
+                logger.info("Started immediate PatientDailyCall for patient=%s id=%s", pid, once_h.id)
+            except Exception as e:
+                logger.exception("Failed to start immediate PatientDailyCall for patient=%s: %s", pid, e)
+
+# ====== Test helpers ======
+async def start_test_workflow(patient_id: int = 2, org_id: int = 1, wait: bool = False):
+    client = await connect_client()
+    wf_id = f"test-wf-{int(time.time())}"
+    handle = await client.start_workflow(
+        PatientDailyCall.run,
+        id=wf_id,
+        task_queue=TASK_QUEUE,
+        args=[patient_id, org_id, None, "annie_RPM", False],
+    )
+    logger.info("Started test workflow id=%s run_id=%s", handle.id, handle.run_id)
+    if wait:
+        logger.info("Waiting for workflow result...")
+        res = await handle.result()
+        logger.info("Workflow result: %s", res)
+        return res
+    return handle
+
+async def create_org_scheduler(org_id: int = SCHEDULE_DEFAULT_ORG_ID, hour_est: int = SCHEDULE_DEFAULT_HOUR_EST, minute_est: int = SCHEDULE_DEFAULT_MINUTE_EST, test_mode: bool = False):
+    client = await connect_client()
+    cron = est_time_to_utc_cron(hour_est, minute_est, tz_name="US/Eastern")
+    wf_id = f"org-scheduler-{org_id}"
+    try:
+        handle = await client.start_workflow(
+            OrgDailyScheduler.run,
+            args=[org_id, test_mode],
+            id=wf_id,
+            task_queue=TASK_QUEUE,
+            cron_schedule=cron,
+        )
+    except Exception as e:
+        logger.exception("Failed to register org scheduler id=%s cron=%s: %s", wf_id, cron, e)
+        raise
+    logger.info("Started org scheduler workflow id=%s cron=%s", handle.id, cron)
+    return handle
+
+# ====== CLI ======
+if __name__ == "__main__":
+    # Single-patient test
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        wait = "--wait" in sys.argv
+        pid = int(os.getenv("TEST_PATIENT_ID", "2"))
+        oid = int(os.getenv("TEST_ORG_ID", "1"))
+        if "--patient" in sys.argv:
+            pid = int(sys.argv[sys.argv.index("--patient") + 1])
+        if "--org" in sys.argv:
+            oid = int(sys.argv[sys.argv.index("--org") + 1])
+        try:
+            res = asyncio.run(start_test_workflow(pid, oid, wait))
+            if wait:
+                print("Workflow completed:", res)
+            else:
+                print("Test workflow started. Check Temporal UI for PatientDailyCall.")
+        except Exception:
+            logger.exception("Failed to start test workflow")
+            sys.exit(1)
+        sys.exit(0)
+
+    # Register per-patient cron schedules
+    if len(sys.argv) > 1 and sys.argv[1] == "per_patient_cron":
+        org = SCHEDULE_DEFAULT_ORG_ID
+        hour = SCHEDULE_DEFAULT_HOUR_EST
+        minute = SCHEDULE_DEFAULT_MINUTE_EST
+        start_now = "--start-now" in sys.argv
+        replace = "--replace" in sys.argv
+        test_mode_flag = "--test" in sys.argv
+
+        if "--org" in sys.argv:
+            org = int(sys.argv[sys.argv.index("--org") + 1])
+        if "--hour" in sys.argv:
+            hour = int(sys.argv[sys.argv.index("--hour") + 1])
+        if "--minute" in sys.argv:
+            minute = int(sys.argv[sys.argv.index("--minute") + 1])
+
+        async def run_reg():
+            await create_per_patient_crons(org, hour, minute, test_mode=test_mode_flag, start_now=start_now, replace_existing=replace)
+
+        try:
+            asyncio.run(run_reg())
+            print(f"Per-patient crons registered for org={org} at {hour:02d}:{minute:02d} EST.")
+        except Exception:
+            logger.exception("per_patient_cron registration failed")
+            sys.exit(1)
+        sys.exit(0)
+
+    # (Optional) Org-level cron
+    if len(sys.argv) > 1 and sys.argv[1] == "create_scheduler":
+        org = SCHEDULE_DEFAULT_ORG_ID
+        hour = SCHEDULE_DEFAULT_HOUR_EST
+        minute = SCHEDULE_DEFAULT_MINUTE_EST
+        test_mode_flag = False
+        if "--org" in sys.argv:
+            org = int(sys.argv[sys.argv.index("--org") + 1])
+        if "--hour" in sys.argv:
+            hour = int(sys.argv[sys.argv.index("--hour") + 1])
+        if "--minute" in sys.argv:
+            minute = int(sys.argv[sys.argv.index("--minute") + 1])
+        if "--test" in sys.argv:
+            test_mode_flag = True
+
+        async def run_cron():
+            await create_org_scheduler(org_id=org, hour_est=hour, minute_est=minute, test_mode=test_mode_flag)
+
+        try:
+            asyncio.run(run_cron())
+            print(f"Org scheduler registered for org={org} at {hour:02d}:{minute:02d} EST.")
+        except Exception:
+            logger.exception("Failed to create org scheduler")
+            sys.exit(1)
+        sys.exit(0)
+
+    # Default: run worker
+    try:
+        asyncio.run(run_worker())
+    except KeyboardInterrupt:
+        logger.info("Worker interrupted by user, exiting.")
+    except Exception:
+        logger.exception("Worker failed")
+        raise
