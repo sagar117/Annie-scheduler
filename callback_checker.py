@@ -20,17 +20,81 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 from temporalio.common import RetryPolicy
 
-# Shared helpers/activities implemented in annie_scheduler.py
-try:
-    from annie_scheduler import (
-        connect_client,
-        list_calls_for_org_on_date,
-        fetch_call_readings,
-        TASK_QUEUE,
-        TEMPORAL_ENDPOINT,
-    )
-except Exception as e:
-    raise ImportError("callback_checker requires annie_scheduler.py exporting required symbols") from e
+# Local implementations (moved here so this file is self-contained)
+# - connect_client: helper to connect to Temporal (same retry behavior as annie_scheduler)
+# - list_calls_for_org_on_date, fetch_call_readings: activities that call backend endpoints.
+TASK_QUEUE = os.getenv("ANNIE_TASK_QUEUE", "annie-task-queue")
+TEMPORAL_ENDPOINT = os.getenv("TEMPORAL_ENDPOINT", "localhost:7233")
+
+
+async def connect_client(retries: int = 6, delay: int = 5) -> Client:
+    """Connect to Temporal endpoint with a small retry loop.
+
+    Mirrors the helper in `annie_scheduler.py` but keeps defaults local to this module.
+    """
+    for i in range(retries):
+        try:
+            client = await Client.connect(TEMPORAL_ENDPOINT)
+            logger.info("Connected to Temporal at %s", TEMPORAL_ENDPOINT)
+            return client
+        except Exception as e:
+            logger.warning("Temporal connect failed (%d/%d): %s", i + 1, retries, e)
+            await asyncio.sleep(delay)
+    logger.error("Could not connect to Temporal at %s after %d attempts", TEMPORAL_ENDPOINT, retries)
+    raise RuntimeError("Temporal connect failed")
+
+
+@activity.defn
+async def list_calls_for_org_on_date(org_id: int, yyyy_mm_dd: str) -> list:
+    """Activity: GET /api/calls?org_id={org_id}&date={yyyy_mm_dd}
+
+    Uses `API_BASE` and `AUTH_HEADER` defined later in this file. Returns a list or [] on non-JSON response.
+    """
+    import aiohttp
+
+    headers = {"Accept": "application/json"}
+    if AUTH_HEADER:
+        headers["Authorization"] = AUTH_HEADER
+    logger.info("Activity[list_calls_for_org_on_date] org=%s date=%s", org_id, yyyy_mm_dd)
+    url = f"{API_BASE}/api/calls/"
+    params = {"org_id": org_id, "date": yyyy_mm_dd}
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(url, params=params, timeout=30, allow_redirects=True, headers=headers)
+        text = await resp.text()
+        if resp.status >= 400:
+            logger.error("Activity[list_calls_for_org_on_date] GET %s returned %s body=%s", resp.url, resp.status, text)
+            resp.raise_for_status()
+        try:
+            js = await resp.json()
+        except Exception:
+            logger.error("Activity[list_calls_for_org_on_date] response not JSON: %s", text)
+            return []
+        logger.info("Activity[list_calls_for_org_on_date] returned %d records", len(js) if isinstance(js, list) else 0)
+        return js
+
+
+@activity.defn
+async def fetch_call_readings(call_id: str):
+    """Activity: GET /api/calls/{call_id}/readings -> raw JSON or text
+
+    Uses `API_BASE` and `AUTH_HEADER` defined later in this file.
+    """
+    import aiohttp
+
+    headers = {"Accept": "application/json"}
+    if AUTH_HEADER:
+        headers["Authorization"] = AUTH_HEADER
+    logger.info("Activity[fetch_call_readings] %s", call_id)
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"{API_BASE}/api/calls/{call_id}/readings", timeout=30, headers=headers)
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        txt = await resp.text()
+        try:
+            return json.loads(txt)
+        except Exception:
+            return txt
 
 # Logging
 LOG_LEVEL = os.getenv("CALLBACK_CHECKER_LOG_LEVEL", "INFO").upper()
