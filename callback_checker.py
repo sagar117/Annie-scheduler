@@ -129,15 +129,27 @@ def parse_readings_from_response(raw: Any) -> List[Dict]:
             except Exception:
                 return out
         if isinstance(candidate, dict):
-            if "value" in candidate and isinstance(candidate["value"], list):
-                for it in candidate["value"]:
+            # Handle the database response format: {readings: [{value: {value: []}}]}
+            if "readings" in candidate and isinstance(candidate["readings"], list):
+                for it in candidate["readings"]:
                     out.extend(_parse_candidate(it))
                 return out
+            # Handle nested value objects: {value: {value: []}}
+            if "value" in candidate:
+                val = candidate["value"]
+                if isinstance(val, dict) and "value" in val:
+                    return _parse_candidate(val["value"])
+                if isinstance(val, list):
+                    for it in val:
+                        out.extend(_parse_candidate(it))
+                    return out
+            # Check if this is a measurement
             measurement_keys = {"systolic", "diastolic", "bp", "hr", "heartrate", "spo2", "type", "value"}
             if measurement_keys.intersection(k.lower() for k in candidate.keys()):
                 out.append(candidate)
                 return out
-            for key in ("readings", "data", "rows", "entries"):
+            # Final check for other list containers
+            for key in ("data", "rows", "entries"):
                 if key in candidate and isinstance(candidate[key], list):
                     for it in candidate[key]:
                         out.extend(_parse_candidate(it))
@@ -383,12 +395,28 @@ class CallbackWindowChecker:
         if not isinstance(calls, list):
             calls = []
 
-        # 4) filter completed calls by Annie (original)
-        completed_by_annie = [
-            c for c in calls
-            if str(c.get("status", "")).lower() == "completed"
-            and str(c.get("agent", "")).lower() == "annie_rpm"
-        ]
+        # 4) filter completed calls by Annie (original) and transform readings shape
+        completed_by_annie = []
+        for call in calls:
+            if (str(call.get("status", "")).lower() == "completed" and
+                str(call.get("agent", "")).lower() == "annie_rpm"):
+                # If this is a DB response with nested readings structure, normalize it
+                if isinstance(call, dict) and "readings" in call and "readings" in call["readings"]:
+                    readings = call["readings"]["readings"]
+                    if isinstance(readings, list) and readings:
+                        reading = readings[0]  # Take first reading
+                        if isinstance(reading, dict):
+                            # Extract value from database format into call for consistency
+                            try:
+                                val = reading.get("value", {})
+                                if isinstance(val, dict) and "value" in val:
+                                    call["value"] = val["value"]
+                                else:
+                                    call["value"] = val
+                            except Exception as e:
+                                logger.warning("[%s] Failed to extract reading value from DB format: %s", wf_id, e)
+                completed_by_annie.append(call)
+                
         logger.info("[%s] Completed_by_annie count=%d", wf_id, len(completed_by_annie))
 
         # 5) helper: return comparable float timestamp for a call
