@@ -307,36 +307,36 @@ class CallbackWindowChecker:
         logger.info("[%s] CallbackWindowChecker start org=%s interval=%s window=%s-%s test=%s",
                     wf_id, org_id, interval_minutes, start_hour_est, end_hour_est, test_mode)
 
-            # 1) Fetch runtime org scheduler settings (backend-driven override)
-            try:
-                org_settings = await workflow.execute_activity(
-                    get_org_scheduler_settings,
-                    args=[org_id],
-                    start_to_close_timeout=timedelta(seconds=10),
-                    retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=1),
-                )
-                if org_settings:
-                    logger.info("[%s] Using org scheduler settings: %s", wf_id, _safe_json_dump(org_settings, 500))
-                else:
-                    org_settings = {}
-            except Exception as e:
-                logger.warning("[%s] Could not fetch org scheduler settings: %s", wf_id, e)
+        # 1) Fetch runtime org scheduler settings (backend-driven override)
+        try:
+            org_settings = await workflow.execute_activity(
+                get_org_scheduler_settings,
+                args=[org_id],
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=1),
+            )
+            if org_settings:
+                logger.info("[%s] Using org scheduler settings: %s", wf_id, _safe_json_dump(org_settings, 500))
+            else:
                 org_settings = {}
+        except Exception as e:
+            logger.warning("[%s] Could not fetch org scheduler settings: %s", wf_id, e)
+            org_settings = {}
 
-            # Apply overrides from org_settings if present
-            try:
-                runtime_interval = int(org_settings.get("interval_minutes", interval_minutes))
-            except Exception:
-                runtime_interval = interval_minutes
-            try:
-                runtime_start = int(org_settings.get("start_hour_est", start_hour_est))
-            except Exception:
-                runtime_start = start_hour_est
-            try:
-                runtime_end = int(org_settings.get("end_hour_est", end_hour_est))
-            except Exception:
-                runtime_end = end_hour_est
-            enabled_flag = bool(org_settings.get("enabled", True))
+        # Apply overrides from org_settings if present
+        try:
+            runtime_interval = int(org_settings.get("interval_minutes", interval_minutes))
+        except Exception:
+            runtime_interval = interval_minutes
+        try:
+            runtime_start = int(org_settings.get("start_hour_est", start_hour_est))
+        except Exception:
+            runtime_start = start_hour_est
+        try:
+            runtime_end = int(org_settings.get("end_hour_est", end_hour_est))
+        except Exception:
+            runtime_end = end_hour_est
+        enabled_flag = bool(org_settings.get("enabled", True))
 
             # 2) EST now via activity
             est_iso = await workflow.execute_activity(get_est_now_iso, start_to_close_timeout=timedelta(seconds=10))
