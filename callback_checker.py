@@ -338,8 +338,8 @@ class CallbackWindowChecker:
             runtime_end = end_hour_est
         enabled_flag = bool(org_settings.get("enabled", True))
 
-            # 2) EST now via activity
-            est_iso = await workflow.execute_activity(get_est_now_iso, start_to_close_timeout=timedelta(seconds=10))
+        # 2) EST now via activity
+        est_iso = await workflow.execute_activity(get_est_now_iso, start_to_close_timeout=timedelta(seconds=10))
         try:
             est_now = datetime.fromisoformat(est_iso)
         except Exception:
