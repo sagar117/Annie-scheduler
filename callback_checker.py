@@ -398,8 +398,9 @@ class CallbackWindowChecker:
         # 4) filter completed calls by Annie (original) and transform readings shape
         completed_by_annie = []
         for call in calls:
+            agent_name = str(call.get("agent", "")).lower()
             if (str(call.get("status", "")).lower() == "completed" and
-                str(call.get("agent", "")).lower() == "annie_rpm"):
+                agent_name in ("annie_rpm", "annie_rpm_followup")):
                 # If this is a DB response with nested readings structure, normalize it
                 if isinstance(call, dict) and "readings" in call and "readings" in call["readings"]:
                     readings = call["readings"]["readings"]
@@ -558,6 +559,31 @@ class CallbackWindowChecker:
             now_utc = workflow.now().astimezone(timezone.utc)
             if last_dt_utc and (now_utc - last_dt_utc) < cooldown_delta:
                 logger.info("[%s] Skip patient=%s: recent call at %s within cooldown %d min", wf_id, pid, last_dt_utc.isoformat(), RECENT_CALL_COOLDOWN_MIN)
+                continue
+
+            # Re-check all completed Annie calls for this patient (both original and followup agents).
+            # If any of these calls already contain valid measurement-like readings, skip
+            # scheduling another follow-up for this patient.
+            calls_for_pid = _calls_for_pid(pid)
+            skip_followup = False
+            for c in calls_for_pid:
+                call_to_check = c.get("id") or c.get("call_id") or c.get("CallSid")
+                try:
+                    raw_recent_readings = await workflow.execute_activity(
+                        fetch_call_readings,
+                        args=[str(call_to_check)],
+                        start_to_close_timeout=timedelta(seconds=15),
+                        retry_policy=RetryPolicy(initial_interval=timedelta(seconds=1), maximum_attempts=1),
+                    )
+                    normalized_recent = parse_readings_from_response(raw_recent_readings)
+                    if any(_is_measurement_like(r) for r in normalized_recent):
+                        logger.info("[%s] Skip patient=%s: call %s already has valid readings (skip follow-up)", wf_id, pid, call_to_check)
+                        skip_followup = True
+                        break
+                except Exception as e:
+                    # If a particular call's readings can't be fetched, continue checking other calls.
+                    logger.debug("[%s] Failed to fetch/parse readings for patient=%s call=%s: %s — checking other calls", wf_id, pid, call_to_check, e)
+            if skip_followup:
                 continue
 
             # resolve patient phone
